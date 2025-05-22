@@ -213,9 +213,9 @@ func createTaskArgs(t *testing.T, args ...interface{}) [][]byte {
 	return serializedArgs
 }
 
-func NewDefaultLogger(prefix string) *log.Logger {
-    return log.New(os.Stdout, prefix, log.LstdFlags|log.Lshortfile)
-}
+// func NewDefaultLogger(prefix string) *log.Logger { // Removed as we use global zerolog.Logger
+//     return log.New(os.Stdout, prefix, log.LstdFlags|log.Lshortfile)
+// }
 
 
 // --- Test Cases (Existing from previous step) ---
@@ -223,14 +223,14 @@ func NewDefaultLogger(prefix string) *log.Logger {
 func TestNewWorker(t *testing.T) {
 	mockBroker := newMockBroker()
 	mockBackend := newMockResultBackend()
-	logger := NewDefaultLogger("test-worker: ") 
+	// logger := NewDefaultLogger("test-worker: ") // Logger is now global
 
 	opts := &WorkerOptions{
 		Broker:        mockBroker,
 		ResultBackend: mockBackend,
 		QueueName:     "test_queue",
 		Concurrency:   2,
-		Logger:        logger,
+		// Logger:        logger, // Logger is now global
 	}
 	worker := NewWorker(opts).(*DefaultWorker) 
 
@@ -246,13 +246,13 @@ func TestNewWorker(t *testing.T) {
 	if worker.concurrency != 2 {
 		t.Errorf("Concurrency mismatch: expected 2, got %d", worker.concurrency)
 	}
-	if worker.logger != logger { // This will fail if logger is nil and worker creates its own. Adjusted.
-		if logger == nil && worker.logger == nil {
-             t.Error("Logger not set correctly (both nil, worker should default)")
-        } else if logger != nil && worker.logger != logger {
-            t.Error("Logger not set correctly")
-        }
-	}
+	// if worker.logger != logger { // This will fail if logger is nil and worker creates its own. Adjusted.
+	// 	if logger == nil && worker.logger == nil {
+    //          t.Error("Logger not set correctly (both nil, worker should default)")
+    //     } else if logger != nil && worker.logger != logger {
+    //         t.Error("Logger not set correctly")
+    //     }
+	// } // Logger is global now, no field in worker
 	if worker.taskHandlers == nil {
 		t.Error("taskHandlers map not initialized")
 	}
@@ -276,9 +276,9 @@ func TestNewWorker(t *testing.T) {
 	if workerDefault.concurrency <= 0 {
 		t.Errorf("Default Concurrency invalid: %d", workerDefault.concurrency)
 	}
-	if workerDefault.logger == nil { // DefaultWorker's NewWorker creates a default logger if nil
-		t.Error("Default Logger should be set by NewWorker")
-	}
+	// if workerDefault.logger == nil { // DefaultWorker's NewWorker creates a default logger if nil
+	// 	t.Error("Default Logger should be set by NewWorker")
+	// } // Logger is global now
 }
 
 func TestDefaultWorker_RegisterTask(t *testing.T) {
@@ -353,28 +353,86 @@ func (tm *testMiddleware) recordCall(name string) {
 	defer tm.mu.Unlock()
 	tm.order = append(tm.order, name)
 }
-func (tm *testMiddleware) BeforeProcessMessage(mc *MiddlewareContext) error {
+func (tm *testMiddleware) BeforeProcessMessage(ctx context.Context, mc *MiddlewareContext) error {
+	spanCtx, span := NewSpan(ctx, "TestMiddleware.BeforeProcessMessage",
+		oteltrace.WithAttributes(
+			attribute.String("middleware.id", tm.id),
+			attribute.String("task.id", mc.Task.TaskID),
+		),
+	)
+	defer span.End()
+
 	tm.recordCall(fmt.Sprintf("%s_BeforeProcessMessage", tm.id))
+	Logger.Debug().Str("middleware_id", tm.id).Str("task_id", mc.Task.TaskID).Msg("BeforeProcessMessage called")
 	tm.beforeProcessCalled = true
 	if mc.Task.Headers == nil { mc.Task.Headers = make(map[string]string) }
 	mc.Task.Headers["mw_"+tm.id] = "before_process_val"
+	
+	if tm.beforeProcessErr != nil {
+		span.RecordError(tm.beforeProcessErr)
+		span.SetStatus(codes.Error, tm.beforeProcessErr.Error())
+	}
 	return tm.beforeProcessErr
 }
-func (tm *testMiddleware) AfterProcessMessage(mc *MiddlewareContext, err error) error {
+func (tm *testMiddleware) AfterProcessMessage(ctx context.Context, mc *MiddlewareContext, err error) error {
+	spanCtx, span := NewSpan(ctx, "TestMiddleware.AfterProcessMessage",
+		oteltrace.WithAttributes(
+			attribute.String("middleware.id", tm.id),
+			attribute.String("task.id", mc.Task.TaskID),
+		),
+	)
+	defer span.End()
+
+	if err != nil {
+		span.RecordError(err, oteltrace.WithAttributes(attribute.String("event", "task_processing_error_received")))
+		span.SetStatus(codes.Error, "Task processing reported an error")
+	}
+
 	tm.recordCall(fmt.Sprintf("%s_AfterProcessMessage", tm.id))
+	Logger.Debug().Str("middleware_id", tm.id).Str("task_id", mc.Task.TaskID).Msg("AfterProcessMessage called")
 	tm.afterProcessCalled = true
 	return nil
 }
-func (tm *testMiddleware) BeforeSendResult(mc *MiddlewareContext, result *ResultMessage) error {
+func (tm *testMiddleware) BeforeSendResult(ctx context.Context, mc *MiddlewareContext, result *ResultMessage) error {
+	spanCtx, span := NewSpan(ctx, "TestMiddleware.BeforeSendResult",
+		oteltrace.WithAttributes(
+			attribute.String("middleware.id", tm.id),
+			attribute.String("task.id", mc.Task.TaskID),
+			attribute.String("result.status", result.Status),
+		),
+	)
+	defer span.End()
+
 	tm.recordCall(fmt.Sprintf("%s_BeforeSendResult", tm.id))
+	Logger.Debug().Str("middleware_id", tm.id).Str("task_id", mc.Task.TaskID).Msg("BeforeSendResult called")
 	tm.beforeSendCalled = true
 	if result.Status != StatusFailure && tm.id == "mw1" { // Let mw1 modify result
 		result.Result = []byte(fmt.Sprintf(`"modified_by_%s"`, tm.id))
+		span.SetAttributes(attribute.Bool("result.modified", true))
+	}
+
+	if tm.beforeSendErr != nil {
+		span.RecordError(tm.beforeSendErr)
+		span.SetStatus(codes.Error, tm.beforeSendErr.Error())
 	}
 	return tm.beforeSendErr
 }
-func (tm *testMiddleware) AfterSendResult(mc *MiddlewareContext, result *ResultMessage, err error) error {
+func (tm *testMiddleware) AfterSendResult(ctx context.Context, mc *MiddlewareContext, result *ResultMessage, err error) error {
+	spanCtx, span := NewSpan(ctx, "TestMiddleware.AfterSendResult",
+		oteltrace.WithAttributes(
+			attribute.String("middleware.id", tm.id),
+			attribute.String("task.id", mc.Task.TaskID),
+		),
+	)
+	defer span.End()
+
+	if err != nil {
+		span.RecordError(err, oteltrace.WithAttributes(attribute.String("event", "send_result_error_received")))
+		span.SetStatus(codes.Error, "Send result reported an error")
+	}
+
 	tm.recordCall(fmt.Sprintf("%s_AfterSendResult", tm.id))
+	Logger.Debug().Str("middleware_id", tm.id).Str("task_id", mc.Task.TaskID).Msg("AfterSendResult called")
 	tm.afterSendCalled = true
 	return nil
 }
